@@ -480,7 +480,32 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                     })
                 messages.extend(tool_msgs)
                 turn += 1
+            elif finish_reason in ("stop", "end_turn") and not msg.tool_calls:
+                # Model returned a text-only response instead of calling a tool.
+                # Inject a continuation message and keep looping — the program.md
+                # loop is infinite and only max_turns should stop it.
+                log_event(jsonl_path, audit_path, {
+                    "event": "continuation_push",
+                    "turn": turn,
+                    "finish_reason": finish_reason,
+                    "msg": "model returned stop with no tool calls — injecting continuation",
+                })
+                print(
+                    f"[harness] model returned {finish_reason} at turn {turn} with no tool calls"
+                    f" — pushing continuation",
+                    flush=True,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You returned a plain text response with no tool calls. "
+                        "You must always act using tools — never respond with text only. "
+                        "Continue the experiment loop immediately by calling a tool."
+                    ),
+                })
+                turn += 1
             else:
+                # length, content_filter, or other terminal finish reasons
                 turns_completed = turn
                 finish_reason = finish_reason or "stop"
                 print(f"\n[harness] done — finish_reason: {finish_reason}", flush=True)
