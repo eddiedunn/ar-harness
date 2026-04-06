@@ -480,7 +480,7 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                     })
                 messages.extend(tool_msgs)
                 turn += 1
-            elif finish_reason in ("stop", "end_turn") and not msg.tool_calls:
+            elif not msg.tool_calls and finish_reason not in ("length", "content_filter"):
                 # Model returned a text-only response instead of calling a tool.
                 # Inject a continuation message and keep looping — the program.md
                 # loop is infinite and only max_turns should stop it.
