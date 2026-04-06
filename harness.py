@@ -719,8 +719,8 @@ def main() -> None:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=2000,
-        help="Maximum agent turns before stopping (default: 2000)",
+        default=1300,
+        help="Maximum agent turns before stopping (default: 1300, ~8h with Claude SDK)",
     )
     parser.add_argument(
         "--model",
