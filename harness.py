@@ -14,6 +14,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import OpenAI
@@ -97,6 +99,77 @@ TOOLS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def append_jsonl(path: Path, obj: dict) -> None:
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj) + "\n")
+    except Exception:
+        pass  # never let logging crash the harness
+
+
+def summarize_text(text: str, max_len: int = 300) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + f"… [{len(text)} chars]"
+
+
+def summarize_args(args: dict) -> dict:
+    out = {}
+    for k, v in args.items():
+        if k == "content":
+            out[k] = summarize_text(str(v), 200)
+        elif k in ("old_string", "new_string"):
+            out[k] = summarize_text(str(v), 100)
+        else:
+            s = str(v)
+            out[k] = s if len(s) <= 200 else s[:200] + "…"
+    return out
+
+
+def log_event(jsonl_path: Path, audit_path: Path, event: dict) -> None:
+    ts = iso_now()
+    event = {"ts": ts, **event}
+    append_jsonl(jsonl_path, event)
+
+    # Plain-text audit line
+    kind = event.get("event", "?")
+    parts = [ts, kind]
+    if "turn" in event:
+        parts.append(f"turn={event['turn']}")
+    if "model" in event:
+        parts.append(f"model={event['model']}")
+    if "finish_reason" in event:
+        parts.append(f"finish_reason={event['finish_reason']}")
+    if "duration_ms" in event:
+        parts.append(f"duration={event['duration_ms']}ms")
+    if "tool" in event:
+        parts.append(f"tool={event['tool']}")
+    if "error" in event:
+        parts.append(f"error={summarize_text(str(event['error']), 120)}")
+    if "msg" in event:
+        parts.append(event["msg"])
+
+    line = "  ".join(parts)
+    try:
+        with audit_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
 def execute_tool(name: str, args: dict, cwd: Path) -> str:
     if name == "Read":
         path = Path(args["file_path"])
@@ -178,7 +251,11 @@ def _assistant_msg(msg) -> dict:
     return d
 
 
-def run(cwd: str, max_turns: int, model: str) -> None:
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_timeout: int) -> None:
     cwd_path = Path(cwd).resolve()
     program_md = cwd_path / "program.md"
 
@@ -194,66 +271,163 @@ def run(cwd: str, max_turns: int, model: str) -> None:
         print("Error: OPENROUTER_API_KEY environment variable not set", file=sys.stderr)
         sys.exit(1)
 
+    jsonl_path = Path(event_log) if event_log else cwd_path / "harness.events.jsonl"
+    audit_path = cwd_path / "harness.audit.log"
+
     system_prompt = program_md.read_text(encoding="utf-8").strip()
-    print(f"[harness] cwd:        {cwd_path}", flush=True)
-    print(f"[harness] model:      {model}", flush=True)
-    print(f"[harness] max_turns:  {max_turns}", flush=True)
-    print(f"[harness] system prompt: {len(system_prompt)} chars", flush=True)
+    print(f"[harness] cwd:             {cwd_path}", flush=True)
+    print(f"[harness] model:           {model}", flush=True)
+    print(f"[harness] max_turns:       {max_turns}", flush=True)
+    print(f"[harness] request_timeout: {request_timeout}s", flush=True)
+    print(f"[harness] event_log:       {jsonl_path}", flush=True)
+    print(f"[harness] system_prompt:   {len(system_prompt)} chars", flush=True)
     print("[harness] starting agent loop...\n", flush=True)
+
+    log_event(jsonl_path, audit_path, {
+        "event": "run_start",
+        "model": model,
+        "cwd": str(cwd_path),
+        "max_turns": max_turns,
+        "request_timeout": request_timeout,
+        "system_prompt_chars": len(system_prompt),
+    })
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
+        timeout=request_timeout,
     )
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": "Begin the experiment. Follow the instructions in your system prompt.",
+            "content": (
+                "Begin the experiment. Follow your system prompt exactly. "
+                "Start by reading any files you need, then proceed with your first experiment iteration."
+            ),
         },
     ]
 
-    for turn in range(1, max_turns + 1):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+    finish_reason = "unknown"
+    turns_completed = 0
 
-        choice = response.choices[0]
-        msg = choice.message
-        messages.append(_assistant_msg(msg))
+    try:
+        for turn in range(1, max_turns + 1):
+            turns_completed = turn - 1
 
-        if msg.content:
-            print(msg.content, flush=True)
+            log_event(jsonl_path, audit_path, {
+                "event": "request_start",
+                "turn": turn,
+                "message_count": len(messages),
+            })
 
-        if choice.finish_reason == "tool_calls" and msg.tool_calls:
-            tool_msgs = []
-            for tc in msg.tool_calls:
-                args = json.loads(tc.function.arguments)
-                arg_summary = ", ".join(
-                    f"{k}={repr(v)[:80]}" for k, v in args.items()
+            t0 = time.monotonic()
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
                 )
-                print(f"[tool:{turn}] {tc.function.name}({arg_summary})", flush=True)
-                result = execute_tool(tc.function.name, args, cwd_path)
-                tool_msgs.append(
-                    {
+            except Exception as exc:
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                log_event(jsonl_path, audit_path, {
+                    "event": "error",
+                    "turn": turn,
+                    "duration_ms": duration_ms,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                })
+                print(f"[harness] request error turn {turn}: {exc}", flush=True)
+                raise
+
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            choice = response.choices[0]
+            msg = choice.message
+            finish_reason = choice.finish_reason
+            messages.append(_assistant_msg(msg))
+
+            log_event(jsonl_path, audit_path, {
+                "event": "request_end",
+                "turn": turn,
+                "duration_ms": duration_ms,
+                "finish_reason": finish_reason,
+                "has_content": bool(msg.content),
+                "tool_call_count": len(msg.tool_calls) if msg.tool_calls else 0,
+            })
+
+            if msg.content:
+                print(msg.content, flush=True)
+
+            if finish_reason == "tool_calls" and msg.tool_calls:
+                tool_msgs = []
+                for tc in msg.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    arg_summary = ", ".join(
+                        f"{k}={repr(v)[:80]}" for k, v in args.items()
+                    )
+                    print(f"[tool:{turn}] {tc.function.name}({arg_summary})", flush=True)
+
+                    log_event(jsonl_path, audit_path, {
+                        "event": "tool_call",
+                        "turn": turn,
+                        "tool": tc.function.name,
+                        "args": summarize_args(args),
+                    })
+
+                    result = execute_tool(tc.function.name, args, cwd_path)
+
+                    log_event(jsonl_path, audit_path, {
+                        "event": "tool_result",
+                        "turn": turn,
+                        "tool": tc.function.name,
+                        "result_chars": len(result),
+                        "result_preview": summarize_text(result, 200),
+                        "is_error": result.startswith("Error"),
+                    })
+
+                    tool_msgs.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result,
-                    }
-                )
-            messages.extend(tool_msgs)
-        else:
-            print(
-                f"\n[harness] done — finish_reason: {choice.finish_reason}",
-                flush=True,
-            )
-            return
+                    })
+                messages.extend(tool_msgs)
+            else:
+                turns_completed = turn
+                finish_reason = finish_reason or "stop"
+                print(f"\n[harness] done — finish_reason: {finish_reason}", flush=True)
+                log_event(jsonl_path, audit_path, {
+                    "event": "run_end",
+                    "turns_completed": turns_completed,
+                    "finish_reason": finish_reason,
+                })
+                return
 
-    print(f"\n[harness] done — max_turns ({max_turns}) reached", flush=True)
+        turns_completed = max_turns
+        finish_reason = "max_turns"
+        print(f"\n[harness] done — max_turns ({max_turns}) reached", flush=True)
+
+    except KeyboardInterrupt:
+        finish_reason = "interrupted"
+        print("\n[harness] interrupted — exiting", flush=True)
+    except Exception as exc:
+        finish_reason = "error"
+        print(f"\n[harness] fatal error: {exc}", flush=True)
+        log_event(jsonl_path, audit_path, {
+            "event": "error",
+            "turn": turns_completed + 1,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "fatal": True,
+        })
+        raise
+    finally:
+        log_event(jsonl_path, audit_path, {
+            "event": "run_end",
+            "turns_completed": turns_completed,
+            "finish_reason": finish_reason,
+        })
 
 
 def main() -> None:
@@ -276,6 +450,17 @@ def main() -> None:
         default="qwen/qwen3.6-plus:free",
         help="OpenRouter model ID (default: qwen/qwen3.6-plus:free)",
     )
+    parser.add_argument(
+        "--event-log",
+        default=None,
+        help="Path for JSONL event log (default: <cwd>/harness.events.jsonl)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=300,
+        help="Per-request timeout in seconds (default: 300)",
+    )
     args = parser.parse_args()
 
     def _sigint(sig, frame):
@@ -283,7 +468,7 @@ def main() -> None:
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
-    run(args.cwd, args.max_turns, args.model)
+    run(args.cwd, args.max_turns, args.model, args.event_log, args.request_timeout)
 
 
 if __name__ == "__main__":
