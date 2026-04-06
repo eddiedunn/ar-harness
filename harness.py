@@ -18,7 +18,45 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import openai
 from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Model fallback chain
+# Free models are tried first (in order). When all free models are
+# rate-limited, the harness switches to paid models and logs a warning.
+# ---------------------------------------------------------------------------
+
+FREE_MODELS = [
+    "qwen/qwen3-coder:free",        # coding-specific, 262k ctx
+    "qwen/qwen3.6-plus:free",       # 1M ctx, current default
+    "openai/gpt-oss-120b:free",     # 120B OSS, 131k ctx
+    "meta-llama/llama-3.3-70b-instruct:free",  # proven tool use, 65k ctx
+]
+
+PAID_MODELS = [
+    "mistralai/devstral-small",         # $0.10/Mtok, 131k, Mistral coding model
+    "deepseek/deepseek-chat-v3-0324",   # $0.20/Mtok, 163k, strong coder
+    "qwen/qwen3-coder",                 # $0.22/Mtok, 262k, paid coding tier
+    "google/gemini-2.5-flash",          # $0.30/Mtok, 1M ctx, strong safety net
+]
+
+
+def build_model_chain(primary: str) -> list[str]:
+    """Return ordered fallback list starting with primary, then remaining
+    free models, then paid models. Deduplicates if primary is already in a list."""
+    seen = {primary}
+    chain = [primary]
+    for m in FREE_MODELS:
+        if m not in seen:
+            seen.add(m)
+            chain.append(m)
+    for m in PAID_MODELS:
+        if m not in seen:
+            seen.add(m)
+            chain.append(m)
+    return chain
+
 
 TOOLS = [
     {
@@ -275,17 +313,23 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
     audit_path = cwd_path / "harness.audit.log"
 
     system_prompt = program_md.read_text(encoding="utf-8").strip()
+    model_chain = build_model_chain(model)
     print(f"[harness] cwd:             {cwd_path}", flush=True)
-    print(f"[harness] model:           {model}", flush=True)
+    print(f"[harness] model:           {model_chain[0]}", flush=True)
+    print(f"[harness] fallback chain:  {' → '.join(model_chain[1:])}", flush=True)
     print(f"[harness] max_turns:       {max_turns}", flush=True)
     print(f"[harness] request_timeout: {request_timeout}s", flush=True)
     print(f"[harness] event_log:       {jsonl_path}", flush=True)
     print(f"[harness] system_prompt:   {len(system_prompt)} chars", flush=True)
     print("[harness] starting agent loop...\n", flush=True)
 
+    model_idx = 0
+    current_model = model_chain[0]
+
     log_event(jsonl_path, audit_path, {
         "event": "run_start",
-        "model": model,
+        "model": current_model,
+        "model_chain": model_chain,
         "cwd": str(cwd_path),
         "max_turns": max_turns,
         "request_timeout": request_timeout,
@@ -313,28 +357,69 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
     turns_completed = 0
 
     try:
-        for turn in range(1, max_turns + 1):
+        turn = 1
+        while turn <= max_turns:
             turns_completed = turn - 1
 
             log_event(jsonl_path, audit_path, {
                 "event": "request_start",
                 "turn": turn,
+                "model": current_model,
                 "message_count": len(messages),
             })
 
             t0 = time.monotonic()
             try:
                 response = client.chat.completions.create(
-                    model=model,
+                    model=current_model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
                 )
+            except openai.RateLimitError as exc:
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                log_event(jsonl_path, audit_path, {
+                    "event": "error",
+                    "turn": turn,
+                    "model": current_model,
+                    "duration_ms": duration_ms,
+                    "error": str(exc),
+                    "error_type": "RateLimitError",
+                })
+                model_idx += 1
+                if model_idx >= len(model_chain):
+                    print(f"[harness] all models exhausted — giving up", flush=True)
+                    raise
+                next_model = model_chain[model_idx]
+                prev_was_free = current_model in FREE_MODELS or current_model.endswith(":free")
+                next_is_paid = next_model in PAID_MODELS
+                if prev_was_free and next_is_paid:
+                    print(
+                        f"[harness] WARNING: all free models rate-limited"
+                        f" — switching to paid: {next_model}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[harness] {current_model} rate-limited"
+                        f" — switching to: {next_model}",
+                        flush=True,
+                    )
+                log_event(jsonl_path, audit_path, {
+                    "event": "model_switch",
+                    "turn": turn,
+                    "from_model": current_model,
+                    "to_model": next_model,
+                    "to_paid": next_is_paid,
+                })
+                current_model = next_model
+                continue  # retry this turn with new model
             except Exception as exc:
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 log_event(jsonl_path, audit_path, {
                     "event": "error",
                     "turn": turn,
+                    "model": current_model,
                     "duration_ms": duration_ms,
                     "error": str(exc),
                     "error_type": type(exc).__name__,
@@ -351,6 +436,7 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
             log_event(jsonl_path, audit_path, {
                 "event": "request_end",
                 "turn": turn,
+                "model": current_model,
                 "duration_ms": duration_ms,
                 "finish_reason": finish_reason,
                 "has_content": bool(msg.content),
@@ -393,6 +479,7 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                         "content": result,
                     })
                 messages.extend(tool_msgs)
+                turn += 1
             else:
                 turns_completed = turn
                 finish_reason = finish_reason or "stop"
