@@ -1,12 +1,14 @@
 [project]
 name = "ar-harness"
 version = "0.1.0"
-description = "Thin Claude Agent SDK harness for Andrej Karpathy's autoresearch protocol"
+description = "Autoresearch agent loop harness via OpenRouter (Gemini 2.0 Flash / any tool-using model)"
 requires-python = ">=3.11"
 dependencies = [
-    "claude-agent-sdk>=0.1.56",
-    "anyio>=4.0.0",
+    "openai>=1.0.0",
 ]
+
+[project.scripts]
+ar-harness = "harness:main"
 
 [build-system]
 requires = ["hatchling"]
