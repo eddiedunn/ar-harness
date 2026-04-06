@@ -1,10 +1,12 @@
 [project]
 name = "ar-harness"
-version = "0.1.0"
-description = "Autoresearch agent loop harness via OpenRouter (Gemini 2.0 Flash / any tool-using model)"
+version = "0.2.0"
+description = "Autoresearch agent loop — supports OpenRouter (any model) and Claude Agent SDK"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0.0",
+    "claude-agent-sdk>=0.1.56",
+    "anyio>=4.0.0",
 ]
 
 [project.scripts]

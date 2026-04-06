@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-ar-harness: Autoresearch agent loop via OpenRouter.
+ar-harness: Autoresearch agent loop.
 
-Reads program.md from --cwd as the system prompt, then runs a tool-using
-agent loop with Read/Write/Edit/Bash tools until max turns or interruption.
+Supports two providers:
+  - OpenRouter (default): any OpenRouter model via OpenAI-compatible API.
+  - Claude Agent SDK: models starting with "claude-" use the Claude Code
+    subprocess SDK, which handles tool execution, context, and auth natively.
 
-Required env var: OPENROUTER_API_KEY
+Provider is auto-detected from --model (claude-* → SDK, else → OpenRouter),
+or overridden explicitly with --provider.
+
+Required env vars:
+  OpenRouter:       OPENROUTER_API_KEY
+  Claude Agent SDK: ANTHROPIC_API_KEY (or use `claude setup-token`)
 """
 
 import argparse
@@ -18,33 +25,38 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import openai
-from openai import OpenAI
+# ---------------------------------------------------------------------------
+# Provider detection
+# ---------------------------------------------------------------------------
+
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_ANTHROPIC = "anthropic"
+
+
+def detect_provider(model: str) -> str:
+    return PROVIDER_ANTHROPIC if model.startswith("claude-") else PROVIDER_OPENROUTER
+
 
 # ---------------------------------------------------------------------------
-# Model fallback chain
-# Free models are tried first (in order). When all free models are
-# rate-limited, the harness switches to paid models and logs a warning.
+# OpenRouter model fallback chain
 # ---------------------------------------------------------------------------
 
 FREE_MODELS = [
-    "qwen/qwen3-coder:free",        # coding-specific, 262k ctx
-    "qwen/qwen3.6-plus:free",       # 1M ctx, current default
-    "openai/gpt-oss-120b:free",     # 120B OSS, 131k ctx
-    "meta-llama/llama-3.3-70b-instruct:free",  # proven tool use, 65k ctx
+    "qwen/qwen3-coder:free",
+    "qwen/qwen3.6-plus:free",
+    "openai/gpt-oss-120b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
 ]
 
 PAID_MODELS = [
-    "mistralai/devstral-small",         # $0.10/Mtok, 131k, Mistral coding model
-    "deepseek/deepseek-chat-v3-0324",   # $0.20/Mtok, 163k, strong coder
-    "qwen/qwen3-coder",                 # $0.22/Mtok, 262k, paid coding tier
-    "google/gemini-2.5-flash",          # $0.30/Mtok, 1M ctx, strong safety net
+    "mistralai/devstral-small",
+    "deepseek/deepseek-chat-v3-0324",
+    "qwen/qwen3-coder",
+    "google/gemini-2.5-flash",
 ]
 
 
 def build_model_chain(primary: str) -> list[str]:
-    """Return ordered fallback list starting with primary, then remaining
-    free models, then paid models. Deduplicates if primary is already in a list."""
     seen = {primary}
     chain = [primary]
     for m in FREE_MODELS:
@@ -57,6 +69,10 @@ def build_model_chain(primary: str) -> list[str]:
             chain.append(m)
     return chain
 
+
+# ---------------------------------------------------------------------------
+# OpenRouter tool definitions
+# ---------------------------------------------------------------------------
 
 TOOLS = [
     {
@@ -118,8 +134,7 @@ TOOLS = [
                 "Run a bash command in the experiment directory. "
                 "Use for git, uv, grep, tail, etc. "
                 "Stdout and stderr are both returned. "
-                "Long-running commands (e.g. uv run train.py) may take several minutes — "
-                "use a generous timeout."
+                "Long-running commands (e.g. uv run experiment.py) may take several minutes."
             ),
             "parameters": {
                 "type": "object",
@@ -150,7 +165,7 @@ def append_jsonl(path: Path, obj: dict) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(obj) + "\n")
     except Exception:
-        pass  # never let logging crash the harness
+        pass
 
 
 def summarize_text(text: str, max_len: int = 300) -> str:
@@ -178,7 +193,6 @@ def log_event(jsonl_path: Path, audit_path: Path, event: dict) -> None:
     event = {"ts": ts, **event}
     append_jsonl(jsonl_path, event)
 
-    # Plain-text audit line
     kind = event.get("event", "?")
     parts = [ts, kind]
     if "turn" in event:
@@ -205,7 +219,7 @@ def log_event(jsonl_path: Path, audit_path: Path, event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tool execution
+# Tool execution (OpenRouter path only — Claude SDK handles tools natively)
 # ---------------------------------------------------------------------------
 
 def execute_tool(name: str, args: dict, cwd: Path) -> str:
@@ -270,7 +284,6 @@ def execute_tool(name: str, args: dict, cwd: Path) -> str:
 
 
 def _assistant_msg(msg) -> dict:
-    """Convert an OpenAI ChatCompletionMessage to a plain dict for the messages list."""
     d: dict = {"role": "assistant"}
     if msg.content:
         d["content"] = msg.content
@@ -290,45 +303,35 @@ def _assistant_msg(msg) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# OpenRouter agent loop
 # ---------------------------------------------------------------------------
 
-def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_timeout: int) -> None:
-    cwd_path = Path(cwd).resolve()
-    program_md = cwd_path / "program.md"
-
-    if not cwd_path.is_dir():
-        print(f"Error: --cwd '{cwd}' is not a directory", file=sys.stderr)
-        sys.exit(1)
-    if not program_md.exists():
-        print(f"Error: program.md not found in '{cwd_path}'", file=sys.stderr)
-        sys.exit(1)
+def run_openrouter(
+    cwd_path: Path,
+    system_prompt: str,
+    max_turns: int,
+    model: str,
+    jsonl_path: Path,
+    audit_path: Path,
+    request_timeout: int,
+) -> None:
+    import openai
+    from openai import OpenAI
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         print("Error: OPENROUTER_API_KEY environment variable not set", file=sys.stderr)
         sys.exit(1)
 
-    jsonl_path = Path(event_log) if event_log else cwd_path / "harness.events.jsonl"
-    audit_path = cwd_path / "harness.audit.log"
-
-    system_prompt = program_md.read_text(encoding="utf-8").strip()
     model_chain = build_model_chain(model)
-    print(f"[harness] cwd:             {cwd_path}", flush=True)
+    print(f"[harness] provider:        openrouter", flush=True)
     print(f"[harness] model:           {model_chain[0]}", flush=True)
     print(f"[harness] fallback chain:  {' → '.join(model_chain[1:])}", flush=True)
-    print(f"[harness] max_turns:       {max_turns}", flush=True)
-    print(f"[harness] request_timeout: {request_timeout}s", flush=True)
-    print(f"[harness] event_log:       {jsonl_path}", flush=True)
-    print(f"[harness] system_prompt:   {len(system_prompt)} chars", flush=True)
-    print("[harness] starting agent loop...\n", flush=True)
-
-    model_idx = 0
-    current_model = model_chain[0]
 
     log_event(jsonl_path, audit_path, {
         "event": "run_start",
-        "model": current_model,
+        "provider": PROVIDER_OPENROUTER,
+        "model": model_chain[0],
         "model_chain": model_chain,
         "cwd": str(cwd_path),
         "max_turns": max_turns,
@@ -353,6 +356,8 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
         },
     ]
 
+    model_idx = 0
+    current_model = model_chain[0]
     finish_reason = "unknown"
     turns_completed = 0
 
@@ -388,7 +393,7 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                 })
                 model_idx += 1
                 if model_idx >= len(model_chain):
-                    print(f"[harness] all models exhausted — giving up", flush=True)
+                    print("[harness] all models exhausted — giving up", flush=True)
                     raise
                 next_model = model_chain[model_idx]
                 prev_was_free = current_model in FREE_MODELS or current_model.endswith(":free")
@@ -413,7 +418,7 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                     "to_paid": next_is_paid,
                 })
                 current_model = next_model
-                continue  # retry this turn with new model
+                continue
             except Exception as exc:
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 log_event(jsonl_path, audit_path, {
@@ -481,9 +486,6 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                 messages.extend(tool_msgs)
                 turn += 1
             elif not msg.tool_calls and finish_reason not in ("length", "content_filter"):
-                # Model returned a text-only response instead of calling a tool.
-                # Inject a continuation message and keep looping — the program.md
-                # loop is infinite and only max_turns should stop it.
                 log_event(jsonl_path, audit_path, {
                     "event": "continuation_push",
                     "turn": turn,
@@ -505,7 +507,6 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
                 })
                 turn += 1
             else:
-                # length, content_filter, or other terminal finish reasons
                 turns_completed = turn
                 finish_reason = finish_reason or "stop"
                 print(f"\n[harness] done — finish_reason: {finish_reason}", flush=True)
@@ -542,6 +543,170 @@ def run(cwd: str, max_turns: int, model: str, event_log: str | None, request_tim
         })
 
 
+# ---------------------------------------------------------------------------
+# Claude Agent SDK loop
+# ---------------------------------------------------------------------------
+
+def run_anthropic(
+    cwd_path: Path,
+    system_prompt: str,
+    max_turns: int,
+    model: str,
+    jsonl_path: Path,
+    audit_path: Path,
+) -> None:
+    import anyio
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        SystemMessage,
+        TextBlock,
+        query,
+    )
+    from claude_agent_sdk._errors import ProcessError
+
+    print(f"[harness] provider:        anthropic (claude-agent-sdk)", flush=True)
+    print(f"[harness] model:           {model}", flush=True)
+
+    log_event(jsonl_path, audit_path, {
+        "event": "run_start",
+        "provider": PROVIDER_ANTHROPIC,
+        "model": model,
+        "cwd": str(cwd_path),
+        "max_turns": max_turns,
+        "system_prompt_chars": len(system_prompt),
+    })
+
+    async def _run() -> None:
+        options = ClaudeAgentOptions(
+            cwd=str(cwd_path),
+            allowed_tools=["Read", "Write", "Edit", "Bash"],
+            permission_mode="bypassPermissions",
+            system_prompt=system_prompt,
+            max_turns=max_turns,
+            model=model,
+        )
+
+        got_result = False
+        turn = 0
+        finish_reason = "unknown"
+
+        try:
+            async for message in query(
+                prompt=(
+                    "Begin the experiment. Follow your system prompt exactly. "
+                    "Start by reading any files you need, then proceed with your first experiment iteration."
+                ),
+                options=options,
+            ):
+                if isinstance(message, SystemMessage):
+                    if message.subtype == "init":
+                        session_id = message.data.get("session_id", "unknown")
+                        print(f"[harness] session: {session_id}\n", flush=True)
+
+                elif isinstance(message, AssistantMessage):
+                    turn += 1
+                    log_event(jsonl_path, audit_path, {
+                        "event": "assistant_message",
+                        "turn": turn,
+                        "model": model,
+                    })
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            print(block.text, flush=True)
+
+                elif isinstance(message, ResultMessage):
+                    got_result = True
+                    finish_reason = message.stop_reason or "done"
+                    print(f"\n[harness] done — stop_reason: {finish_reason}", flush=True)
+                    if message.result:
+                        print(f"[harness] result:\n{message.result}", flush=True)
+                    log_event(jsonl_path, audit_path, {
+                        "event": "run_end",
+                        "turns_completed": turn,
+                        "finish_reason": finish_reason,
+                    })
+
+        except Exception as exc:
+            msg = str(exc)
+            is_max_turns_exit = "exit code: 1" in msg or (
+                isinstance(exc, ProcessError) and exc.exit_code == 1
+            )
+            if got_result and is_max_turns_exit:
+                print(
+                    "[harness] subprocess exited with code 1 after result (normal for max_turns)",
+                    flush=True,
+                )
+            else:
+                log_event(jsonl_path, audit_path, {
+                    "event": "error",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "fatal": True,
+                })
+                log_event(jsonl_path, audit_path, {
+                    "event": "run_end",
+                    "turns_completed": turn,
+                    "finish_reason": "error",
+                })
+                raise
+
+    try:
+        anyio.run(_run)
+    except KeyboardInterrupt:
+        print("\n[harness] interrupted — exiting", flush=True)
+        log_event(jsonl_path, audit_path, {
+            "event": "run_end",
+            "turns_completed": 0,
+            "finish_reason": "interrupted",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run(
+    cwd: str,
+    max_turns: int,
+    model: str,
+    provider: str | None,
+    event_log: str | None,
+    request_timeout: int,
+) -> None:
+    cwd_path = Path(cwd).resolve()
+    program_md = cwd_path / "program.md"
+
+    if not cwd_path.is_dir():
+        print(f"Error: --cwd '{cwd}' is not a directory", file=sys.stderr)
+        sys.exit(1)
+    if not program_md.exists():
+        print(f"Error: program.md not found in '{cwd_path}'", file=sys.stderr)
+        sys.exit(1)
+
+    resolved_provider = provider or detect_provider(model)
+
+    jsonl_path = Path(event_log) if event_log else cwd_path / "harness.events.jsonl"
+    audit_path = cwd_path / "harness.audit.log"
+
+    system_prompt = program_md.read_text(encoding="utf-8").strip()
+
+    print(f"[harness] cwd:             {cwd_path}", flush=True)
+    print(f"[harness] max_turns:       {max_turns}", flush=True)
+    print(f"[harness] request_timeout: {request_timeout}s", flush=True)
+    print(f"[harness] event_log:       {jsonl_path}", flush=True)
+    print(f"[harness] system_prompt:   {len(system_prompt)} chars", flush=True)
+    print("[harness] starting agent loop...\n", flush=True)
+
+    if resolved_provider == PROVIDER_ANTHROPIC:
+        run_anthropic(cwd_path, system_prompt, max_turns, model, jsonl_path, audit_path)
+    else:
+        run_openrouter(
+            cwd_path, system_prompt, max_turns, model, jsonl_path, audit_path, request_timeout
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the autoresearch agent loop in a given experiment directory."
@@ -560,7 +725,13 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default="qwen/qwen3.6-plus:free",
-        help="OpenRouter model ID (default: qwen/qwen3.6-plus:free)",
+        help="Model ID — claude-* models auto-select the Anthropic provider (default: qwen/qwen3.6-plus:free)",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=[PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC],
+        default=None,
+        help="Override provider auto-detection (anthropic=Claude Agent SDK, openrouter=OpenRouter API)",
     )
     parser.add_argument(
         "--event-log",
@@ -571,7 +742,7 @@ def main() -> None:
         "--request-timeout",
         type=int,
         default=300,
-        help="Per-request timeout in seconds (default: 300)",
+        help="Per-request timeout in seconds, OpenRouter only (default: 300)",
     )
     args = parser.parse_args()
 
@@ -580,7 +751,7 @@ def main() -> None:
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
-    run(args.cwd, args.max_turns, args.model, args.event_log, args.request_timeout)
+    run(args.cwd, args.max_turns, args.model, args.provider, args.event_log, args.request_timeout)
 
 
 if __name__ == "__main__":
